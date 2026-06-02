@@ -56,6 +56,9 @@ public class ContentController {
                 request.subtitleKo(),
                 request.subtitleEn(),
                 request.subtitleJp(),
+                request.sceneDescriptionKo(),
+                request.sceneDescriptionEn(),
+                request.sceneDescriptionJp(),
                 request.audioKoPath(),
                 request.audioEnPath(),
                 request.audioJpPath()
@@ -72,6 +75,9 @@ public class ContentController {
                 request.subtitleKo(),
                 request.subtitleEn(),
                 request.subtitleJp(),
+                request.sceneDescriptionKo(),
+                request.sceneDescriptionEn(),
+                request.sceneDescriptionJp(),
                 request.audioKoPath(),
                 request.audioEnPath(),
                 request.audioJpPath()

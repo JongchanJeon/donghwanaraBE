@@ -45,6 +45,9 @@ public class BoardService {
                         contentRequest.subtitleKo(),
                         contentRequest.subtitleEn(),
                         contentRequest.subtitleJp(),
+                        contentRequest.sceneDescriptionKo(),
+                        contentRequest.sceneDescriptionEn(),
+                        contentRequest.sceneDescriptionJp(),
                         contentRequest.audioKoPath(),
                         contentRequest.audioEnPath(),
                         contentRequest.audioJpPath()

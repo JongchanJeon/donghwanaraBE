@@ -10,6 +10,9 @@ public record ContentResponse(
         String subtitleKo,
         String subtitleEn,
         String subtitleJp,
+        String sceneDescriptionKo,
+        String sceneDescriptionEn,
+        String sceneDescriptionJp,
         String audioKoPath,
         String audioEnPath,
         String audioJpPath
@@ -23,6 +26,9 @@ public record ContentResponse(
                 content.getSubtitleKo(),
                 content.getSubtitleEn(),
                 content.getSubtitleJp(),
+                content.getSceneDescriptionKo(),
+                content.getSceneDescriptionEn(),
+                content.getSceneDescriptionJp(),
                 content.getAudioKoPath(),
                 content.getAudioEnPath(),
                 content.getAudioJpPath()
