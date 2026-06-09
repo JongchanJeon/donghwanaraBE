@@ -11,6 +11,7 @@ import com.example.donghwanara.story.dto.StoryGenerateRequest;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -31,16 +32,23 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Service
 public class StoryGenerateService {
 
     private static final Logger log = LoggerFactory.getLogger(StoryGenerateService.class);
     private static final int MAX_RETRY_ATTEMPTS = 3;
+    private static final long IMAGE_RATE_LIMIT_WINDOW_MILLIS = 60_000L;
 
     private final BoardRepository boardRepository;
     private final ContentRepository contentRepository;
@@ -53,6 +61,11 @@ public class StoryGenerateService {
     private final String ttsModel;
     private final String ttsVoice;
     private final Path generatedMediaDir;
+    private final int assetConcurrency;
+    private final ExecutorService backgroundExecutor;
+    private final int imageRequestsPerMinute;
+    private final Object imageRateLimitLock = new Object();
+    private final Deque<Long> imageRequestStartedAt = new ArrayDeque<>();
 
     public StoryGenerateService(
             BoardRepository boardRepository,
@@ -66,7 +79,10 @@ public class StoryGenerateService {
             @Value("${openai.tts-model:gpt-4o-mini-tts}") String ttsModel,
             @Value("${openai.tts-voice:shimmer}") String ttsVoice,
             @Value("${openai.base-url:https://api.openai.com/v1}") String baseUrl,
-            @Value("${story.generated-media-dir:generated-media}") String generatedMediaDir
+            @Value("${story.generated-media-dir:generated-media}") String generatedMediaDir,
+            @Value("${story.asset-concurrency:8}") int assetConcurrency,
+            @Value("${story.background-concurrency:2}") int backgroundConcurrency,
+            @Value("${story.image-requests-per-minute:5}") int imageRequestsPerMinute
     ) {
         this.boardRepository = boardRepository;
         this.contentRepository = contentRepository;
@@ -79,6 +95,14 @@ public class StoryGenerateService {
         this.ttsModel = ttsModel;
         this.ttsVoice = ttsVoice;
         this.generatedMediaDir = Path.of(generatedMediaDir).toAbsolutePath().normalize();
+        this.assetConcurrency = Math.max(1, assetConcurrency);
+        this.backgroundExecutor = Executors.newFixedThreadPool(Math.max(1, backgroundConcurrency));
+        this.imageRequestsPerMinute = Math.max(1, imageRequestsPerMinute);
+    }
+
+    @PreDestroy
+    public void shutdownExecutors() {
+        backgroundExecutor.shutdown();
     }
 
     public BoardContentsCreateResponse generate(StoryGenerateRequest request) {
@@ -94,17 +118,12 @@ public class StoryGenerateService {
         writeStoryJson(storyDir, draft);
         log.info("Story JSON saved. storyKey={}, path={}", storyKey, storyDir.resolve("story.json"));
 
-        List<GeneratedPageAssets> generatedPageAssets = draft.pages()
-                .stream()
-                .sorted(Comparator.comparing(OpenAiStoryPage::pageNumber))
-                .map(page -> generatePageAssets(storyKey, storyDir, draft.mainCharacters(), page))
-                .toList();
-
-        BoardContentsCreateResponse response = transactionTemplate.execute(
-                status -> saveGeneratedStory(request, draft, generatedPageAssets)
+        SavedStory savedStory = transactionTemplate.execute(
+                status -> saveGeneratedStoryWithPendingAssets(request, draft, storyKey, storyDir)
         );
-        log.info("Story generation finished. boardId={}, storyKey={}", response.board().id(), storyKey);
-        return response;
+        scheduleBackgroundAssetGeneration(storyKey, storyDir, draft, savedStory.targets());
+        log.info("Story generation response returned. boardId={}, storyKey={}", savedStory.response().board().id(), storyKey);
+        return savedStory.response();
     }
 
     private OpenAiStoryDraft createDraft(StoryGenerateRequest request) {
@@ -134,19 +153,102 @@ public class StoryGenerateService {
         }
     }
 
-    private GeneratedPageAssets generatePageAssets(
+    private void scheduleBackgroundAssetGeneration(
+            String storyKey,
+            Path storyDir,
+            OpenAiStoryDraft draft,
+            List<PageGenerationTarget> targets
+    ) {
+        CompletableFuture.runAsync(
+                () -> generateAndPersistAssetsInBackground(storyKey, storyDir, draft, targets),
+                backgroundExecutor
+        ).exceptionally(ex -> {
+            log.error("Background asset generation failed. storyKey={}, failure={}", storyKey, summarizeException(ex));
+            return null;
+        });
+        log.info("Background asset generation scheduled. storyKey={}", storyKey);
+    }
+
+    private void generateAndPersistAssetsInBackground(
+            String storyKey,
+            Path storyDir,
+            OpenAiStoryDraft draft,
+            List<PageGenerationTarget> targets
+    ) {
+        List<OpenAiStoryPage> pages = draft.pages()
+                .stream()
+                .sorted(Comparator.comparing(OpenAiStoryPage::pageNumber))
+                .toList();
+        int workerCount = Math.min(assetConcurrency, pages.size() * 4);
+        log.info(
+                "Parallel page asset generation started. pageCount={}, workerCount={}",
+                pages.size(),
+                workerCount
+        );
+
+        ExecutorService executorService = Executors.newFixedThreadPool(workerCount);
+        try {
+            List<PageAssetFutures> futures = pages.stream()
+                    .map(page -> submitPageAssetTasks(storyKey, storyDir, draft.mainCharacters(), page, executorService))
+                    .toList();
+
+            Map<Integer, PageGenerationTarget> targetByPageNumber = new LinkedHashMap<>();
+            for (PageGenerationTarget target : targets) {
+                targetByPageNumber.put(target.pageNumber(), target);
+            }
+
+            for (PageAssetFutures future : futures) {
+                GeneratedPageAssets assets = joinPageAssetFutures(future);
+                PageGenerationTarget target = targetByPageNumber.get(assets.page().pageNumber());
+                if (target == null) {
+                    log.warn("Content target was not found for generated page. pageNumber={}", assets.page().pageNumber());
+                    continue;
+                }
+                updateContentAssets(target.contentId(), assets);
+            }
+            log.info("Background page asset generation finished. storyKey={}, pageCount={}", storyKey, pages.size());
+        } finally {
+            executorService.shutdown();
+        }
+    }
+
+    private PageAssetFutures submitPageAssetTasks(
             String storyKey,
             Path storyDir,
             List<OpenAiMainCharacter> mainCharacters,
-            OpenAiStoryPage page
+            OpenAiStoryPage page,
+            ExecutorService executorService
     ) {
-        log.info("Page asset generation started. pageNumber={}", page.pageNumber());
-        String imagePath = generateImage(storyKey, storyDir, mainCharacters, page);
-        String audioKoPath = generateSpeech(storyKey, storyDir, page, "ko");
-        String audioEnPath = generateSpeech(storyKey, storyDir, page, "en");
-        String audioJpPath = generateSpeech(storyKey, storyDir, page, "ja");
-        log.info("Page asset generation finished. pageNumber={}", page.pageNumber());
-        return new GeneratedPageAssets(page, imagePath, audioKoPath, audioEnPath, audioJpPath);
+        log.info("Page asset tasks submitted. pageNumber={}", page.pageNumber());
+        return new PageAssetFutures(
+                page,
+                CompletableFuture.supplyAsync(() -> generateImage(storyKey, storyDir, mainCharacters, page), executorService),
+                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "ko"), executorService),
+                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "en"), executorService),
+                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "ja"), executorService)
+        );
+    }
+
+    private GeneratedPageAssets joinPageAssetFutures(PageAssetFutures futures) {
+        int pageNumber = futures.page().pageNumber();
+        String imagePath = joinAssetFuture(futures.imagePath(), pageNumber, "image");
+        String audioKoPath = joinAssetFuture(futures.audioKoPath(), pageNumber, "audio-ko");
+        String audioEnPath = joinAssetFuture(futures.audioEnPath(), pageNumber, "audio-en");
+        String audioJpPath = joinAssetFuture(futures.audioJpPath(), pageNumber, "audio-ja");
+        log.info("Page asset generation finished. pageNumber={}", pageNumber);
+        return new GeneratedPageAssets(futures.page(), imagePath, audioKoPath, audioEnPath, audioJpPath);
+    }
+
+    private String joinAssetFuture(CompletableFuture<String> future, int pageNumber, String assetType) {
+        try {
+            return future.join();
+        } catch (CompletionException ex) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "Failed to generate " + assetType + " for page " + pageNumber,
+                    ex.getCause() == null ? ex : ex.getCause()
+            );
+        }
     }
 
     private String generateImage(
@@ -159,6 +261,7 @@ public class StoryGenerateService {
         try {
             log.info("OpenAI image request started. pageNumber={}, model={}", pageNumber, imageModel);
             String b64Image = retry("image generation page " + pageNumber, () -> {
+                acquireImageRequestSlot(pageNumber);
                 JsonNode response = restClient.post()
                         .uri("/images/generations")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
@@ -175,7 +278,7 @@ public class StoryGenerateService {
             log.info("OpenAI image saved. pageNumber={}, path={}", pageNumber, imagePath);
             return "/generated/%s/images/%s".formatted(storyKey, imagePath.getFileName());
         } catch (Exception ex) {
-            log.warn("Image generation failed. pageNumber={}", pageNumber, ex);
+            log.warn("Image generation failed. pageNumber={}, failure={}", pageNumber, summarizeException(ex));
             return writeImageFallback(storyKey, storyDir, pageNumber);
         }
     }
@@ -217,12 +320,13 @@ public class StoryGenerateService {
         }
     }
 
-    private BoardContentsCreateResponse saveGeneratedStory(
+    private SavedStory saveGeneratedStoryWithPendingAssets(
             StoryGenerateRequest request,
             OpenAiStoryDraft draft,
-            List<GeneratedPageAssets> generatedPageAssets
+            String storyKey,
+            Path storyDir
     ) {
-        log.info("Saving generated story to database. pageCount={}", generatedPageAssets.size());
+        log.info("Saving generated story placeholders to database. pageCount={}", draft.pages().size());
         Board board = boardRepository.save(new Board(
                 limit(firstNonBlank(draft.title().ko(), request.title(), autoTitle(request.prompt())), 50),
                 limit(request.prompt(), 256),
@@ -231,31 +335,87 @@ public class StoryGenerateService {
         ));
 
         List<Content> contents = new ArrayList<>();
-        for (GeneratedPageAssets assets : generatedPageAssets) {
-            OpenAiStoryPage page = assets.page();
+        for (OpenAiStoryPage page : draft.pages().stream().sorted(Comparator.comparing(OpenAiStoryPage::pageNumber)).toList()) {
+            int pageNumber = page.pageNumber();
             contents.add(new Content(
                     board,
-                    page.pageNumber(),
-                    assets.imagePath(),
+                    pageNumber,
+                    writePendingImage(storyKey, storyDir, pageNumber),
                     limit(page.text().ko(), 1000),
                     limit(page.text().en(), 1000),
                     limit(page.text().ja(), 1000),
                     limit(page.sceneDescription().ko(), 1000),
                     limit(page.sceneDescription().en(), 1000),
                     limit(page.sceneDescription().ja(), 1000),
-                    assets.audioKoPath(),
-                    assets.audioEnPath(),
-                    assets.audioJpPath()
+                    pendingAudioPath(storyKey, pageNumber, "ko"),
+                    pendingAudioPath(storyKey, pageNumber, "en"),
+                    pendingAudioPath(storyKey, pageNumber, "ja")
             ));
         }
 
-        List<ContentResponse> contentResponses = contentRepository.saveAll(contents)
+        List<Content> savedContents = contentRepository.saveAll(contents);
+        List<ContentResponse> contentResponses = savedContents
                 .stream()
                 .map(ContentResponse::from)
                 .toList();
+        List<PageGenerationTarget> targets = savedContents
+                .stream()
+                .map(content -> new PageGenerationTarget(content.getId(), content.getSeq()))
+                .toList();
 
-        log.info("Generated story saved to database. boardId={}, contentCount={}", board.getId(), contentResponses.size());
-        return new BoardContentsCreateResponse(BoardResponse.from(board), contentResponses);
+        log.info("Generated story placeholders saved. boardId={}, contentCount={}", board.getId(), contentResponses.size());
+        return new SavedStory(new BoardContentsCreateResponse(BoardResponse.from(board), contentResponses), targets);
+    }
+
+    private void updateContentAssets(Integer contentId, GeneratedPageAssets assets) {
+        transactionTemplate.executeWithoutResult(status -> {
+            Content content = contentRepository.findById(contentId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Content not found"));
+            content.update(
+                    content.getSeq(),
+                    assets.imagePath(),
+                    content.getSubtitleKo(),
+                    content.getSubtitleEn(),
+                    content.getSubtitleJp(),
+                    content.getSceneDescriptionKo(),
+                    content.getSceneDescriptionEn(),
+                    content.getSceneDescriptionJp(),
+                    assets.audioKoPath(),
+                    assets.audioEnPath(),
+                    assets.audioJpPath()
+            );
+            contentRepository.save(content);
+        });
+        log.info(
+                "Generated page assets persisted. contentId={}, pageNumber={}",
+                contentId,
+                assets.page().pageNumber()
+        );
+    }
+
+    private String writePendingImage(String storyKey, Path storyDir, int pageNumber) {
+        try {
+            Path pendingPath = storyDir.resolve("images").resolve("page-%02d-pending.svg".formatted(pageNumber));
+            Files.createDirectories(pendingPath.getParent());
+            Files.writeString(pendingPath, """
+                    <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+                      <rect width="1024" height="1024" fill="#f8eadf"/>
+                      <circle cx="512" cy="430" r="170" fill="#f5c7b8"/>
+                      <text x="512" y="650" text-anchor="middle" font-family="sans-serif" font-size="44" fill="#7a5b4f">Generating image...</text>
+                    </svg>
+                    """);
+            return "/generated/%s/images/%s".formatted(storyKey, pendingPath.getFileName());
+        } catch (IOException ex) {
+            throw new ResponseStatusException(
+                    HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Failed to save pending image for page " + pageNumber,
+                    ex
+            );
+        }
+    }
+
+    private String pendingAudioPath(String storyKey, int pageNumber, String languageCode) {
+        return "/generated/%s/audio/%s/page-%02d-pending.mp3".formatted(storyKey, languageCode, pageNumber);
     }
 
     private Map<String, Object> storyRequestBody(StoryGenerateRequest request) {
@@ -506,12 +666,42 @@ public class StoryGenerateService {
         return String.join("\n", descriptions);
     }
 
+    private void acquireImageRequestSlot(int pageNumber) {
+        while (true) {
+            long waitMillis;
+            synchronized (imageRateLimitLock) {
+                long now = System.currentTimeMillis();
+                while (!imageRequestStartedAt.isEmpty()
+                        && now - imageRequestStartedAt.peekFirst() >= IMAGE_RATE_LIMIT_WINDOW_MILLIS) {
+                    imageRequestStartedAt.removeFirst();
+                }
+
+                if (imageRequestStartedAt.size() < imageRequestsPerMinute) {
+                    imageRequestStartedAt.addLast(now);
+                    return;
+                }
+
+                waitMillis = imageRequestStartedAt.peekFirst() + IMAGE_RATE_LIMIT_WINDOW_MILLIS - now + 250L;
+            }
+
+            log.info(
+                    "Waiting for image rate limit. pageNumber={}, waitMs={}, limitPerMinute={}",
+                    pageNumber,
+                    waitMillis,
+                    imageRequestsPerMinute
+            );
+            sleepMillis(waitMillis);
+        }
+    }
+
     private <T> T retry(String operationName, RetryableOperation<T> operation) {
         RuntimeException lastException = null;
         for (int attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+            long retryDelayMillis = 500L * attempt;
             try {
                 return operation.run();
             } catch (RestClientResponseException ex) {
+                retryDelayMillis = retryDelayMillis(ex, attempt);
                 lastException = new ResponseStatusException(
                         HttpStatus.BAD_GATEWAY,
                         "OpenAI API request failed: " + ex.getResponseBodyAsString(),
@@ -524,16 +714,45 @@ public class StoryGenerateService {
             }
 
             if (attempt < MAX_RETRY_ATTEMPTS) {
-                log.warn("Retrying OpenAI operation. operation={}, attempt={}", operationName, attempt + 1, lastException);
-                sleepBeforeRetry(attempt);
+                log.warn(
+                        "Retrying OpenAI operation. operation={}, attempt={}, waitMs={}, failure={}",
+                        operationName,
+                        attempt + 1,
+                        retryDelayMillis,
+                        summarizeException(lastException)
+                );
+                sleepMillis(retryDelayMillis);
             }
         }
         throw lastException;
     }
 
-    private void sleepBeforeRetry(int attempt) {
+    private long retryDelayMillis(RestClientResponseException ex, int attempt) {
+        if (ex.getStatusCode().value() == 429) {
+            String retryAfter = ex.getResponseHeaders() == null ? null : ex.getResponseHeaders().getFirst("Retry-After");
+            if (StringUtils.hasText(retryAfter)) {
+                try {
+                    return Math.max(1L, Long.parseLong(retryAfter.trim())) * 1000L + 250L;
+                } catch (NumberFormatException ignored) {
+                    log.debug("Retry-After header was not numeric. value={}", retryAfter);
+                }
+            }
+            return 12_250L;
+        }
+        return 500L * attempt;
+    }
+
+    private String summarizeException(Throwable throwable) {
+        if (throwable == null) {
+            return "unknown";
+        }
+        String message = throwable.getMessage();
+        return throwable.getClass().getSimpleName() + (StringUtils.hasText(message) ? ": " + message : "");
+    }
+
+    private void sleepMillis(long millis) {
         try {
-            Thread.sleep(500L * attempt);
+            Thread.sleep(Math.max(1L, millis));
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "OpenAI retry was interrupted", ex);
@@ -589,6 +808,27 @@ public class StoryGenerateService {
             String audioKoPath,
             String audioEnPath,
             String audioJpPath
+    ) {
+    }
+
+    private record SavedStory(
+            BoardContentsCreateResponse response,
+            List<PageGenerationTarget> targets
+    ) {
+    }
+
+    private record PageGenerationTarget(
+            Integer contentId,
+            Integer pageNumber
+    ) {
+    }
+
+    private record PageAssetFutures(
+            OpenAiStoryPage page,
+            CompletableFuture<String> imagePath,
+            CompletableFuture<String> audioKoPath,
+            CompletableFuture<String> audioEnPath,
+            CompletableFuture<String> audioJpPath
     ) {
     }
 
