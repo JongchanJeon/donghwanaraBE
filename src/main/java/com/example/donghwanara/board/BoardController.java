@@ -1,9 +1,12 @@
 package com.example.donghwanara.board;
 
+import com.example.donghwanara.auth.AuthService;
 import com.example.donghwanara.board.dto.BoardContentsCreateRequest;
 import com.example.donghwanara.board.dto.BoardContentsCreateResponse;
 import com.example.donghwanara.board.dto.BoardRequest;
 import com.example.donghwanara.board.dto.BoardResponse;
+import com.example.donghwanara.member.Member;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
@@ -27,6 +30,7 @@ public class BoardController {
 
     private final BoardRepository boardRepository;
     private final BoardService boardService;
+    private final AuthService authService;
 
     @GetMapping
     public List<BoardResponse> findAll() {
@@ -39,6 +43,15 @@ public class BoardController {
     @GetMapping("/{id}")
     public BoardResponse findOne(@PathVariable Integer id) {
         return BoardResponse.from(findBoard(id));
+    }
+
+    @GetMapping("/mine")
+    public List<BoardResponse> findMine(HttpServletRequest httpRequest) {
+        Member member = authService.requireAuthenticated(httpRequest);
+        return boardRepository.findByMemberIdAndDeletedDateIsNullOrderByIdDesc(member.getId())
+                .stream()
+                .map(BoardResponse::from)
+                .toList();
     }
 
     @PostMapping
@@ -64,8 +77,14 @@ public class BoardController {
 
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
-    public void delete(@PathVariable Integer id) {
+    public void delete(@PathVariable Integer id, HttpServletRequest httpRequest) {
         Board board = findBoard(id);
+        if (board.getMember() != null) {
+            Member member = authService.requireAuthenticated(httpRequest);
+            if (!board.isOwnedBy(member)) {
+                throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Only the owner can delete this board");
+            }
+        }
         board.delete();
         boardRepository.save(board);
     }

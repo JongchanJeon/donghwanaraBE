@@ -1,10 +1,14 @@
 package com.example.donghwanara.board;
 
+import com.example.donghwanara.member.Member;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
 import jakarta.persistence.PrePersist;
 import jakarta.persistence.Table;
 import lombok.AccessLevel;
@@ -35,6 +39,10 @@ public class Board {
     @Column(nullable = false)
     private Integer status;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "member_id")
+    private Member member;
+
     @Column(name = "created_date", nullable = false)
     private LocalDateTime createdDate;
 
@@ -42,10 +50,15 @@ public class Board {
     private LocalDateTime deletedDate;
 
     public Board(String title, String contents, String summary, Integer status) {
+        this(title, contents, summary, status, null);
+    }
+
+    public Board(String title, String contents, String summary, Integer status, Member member) {
         this.title = title;
         this.contents = contents;
         this.summary = summary;
         this.status = status;
+        this.member = member;
     }
 
     @PrePersist
@@ -64,5 +77,11 @@ public class Board {
 
     public void delete() {
         this.deletedDate = LocalDateTime.now();
+    }
+
+    public boolean isOwnedBy(Member member) {
+        return this.member != null
+                && member != null
+                && this.member.getId().equals(member.getId());
     }
 }

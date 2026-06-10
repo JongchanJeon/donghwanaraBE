@@ -9,6 +9,8 @@ public interface BoardRepository extends JpaRepository<Board, Integer> {
 
     List<Board> findByDeletedDateIsNullOrderByIdDesc();
 
+    List<Board> findByMemberIdAndDeletedDateIsNullOrderByIdDesc(Integer memberId);
+
     Optional<Board> findByIdAndDeletedDateIsNull(Integer id);
 
     Optional<Board> findByTitleAndDeletedDateIsNull(String title);

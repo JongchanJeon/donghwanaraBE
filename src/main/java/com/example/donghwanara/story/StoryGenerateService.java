@@ -7,6 +7,8 @@ import com.example.donghwanara.board.dto.BoardResponse;
 import com.example.donghwanara.content.Content;
 import com.example.donghwanara.content.ContentRepository;
 import com.example.donghwanara.content.dto.ContentResponse;
+import com.example.donghwanara.member.Member;
+import com.example.donghwanara.member.MemberRepository;
 import com.example.donghwanara.story.dto.StoryGenerateRequest;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -52,10 +54,11 @@ public class StoryGenerateService {
 
     private final BoardRepository boardRepository;
     private final ContentRepository contentRepository;
+    private final MemberRepository memberRepository;
     private final ObjectMapper objectMapper;
     private final RestClient restClient;
     private final TransactionTemplate transactionTemplate;
-    private final String apiKey;
+    private final String configuredApiKey;
     private final String storyModel;
     private final String imageModel;
     private final String ttsModel;
@@ -70,6 +73,7 @@ public class StoryGenerateService {
     public StoryGenerateService(
             BoardRepository boardRepository,
             ContentRepository contentRepository,
+            MemberRepository memberRepository,
             ObjectMapper objectMapper,
             RestClient.Builder restClientBuilder,
             PlatformTransactionManager transactionManager,
@@ -86,10 +90,11 @@ public class StoryGenerateService {
     ) {
         this.boardRepository = boardRepository;
         this.contentRepository = contentRepository;
+        this.memberRepository = memberRepository;
         this.objectMapper = objectMapper;
         this.restClient = restClientBuilder.baseUrl(baseUrl).build();
         this.transactionTemplate = new TransactionTemplate(transactionManager);
-        this.apiKey = apiKey;
+        this.configuredApiKey = apiKey;
         this.storyModel = storyModel;
         this.imageModel = imageModel;
         this.ttsModel = ttsModel;
@@ -105,11 +110,12 @@ public class StoryGenerateService {
         backgroundExecutor.shutdown();
     }
 
-    public BoardContentsCreateResponse generate(StoryGenerateRequest request) {
+    public BoardContentsCreateResponse generate(StoryGenerateRequest request, Member member) {
         log.info("Story generation started.");
-        ensureApiKeyConfigured();
+        String apiKey = configuredApiKey();
+        ensureStoryPointExists(member);
 
-        OpenAiStoryDraft draft = createDraft(request);
+        OpenAiStoryDraft draft = createDraft(request, apiKey);
         log.info("Story content generated. title={}, pageCount={}", draft.title().ko(), draft.pages().size());
 
         String storyKey = UUID.randomUUID().toString();
@@ -119,14 +125,14 @@ public class StoryGenerateService {
         log.info("Story JSON saved. storyKey={}, path={}", storyKey, storyDir.resolve("story.json"));
 
         SavedStory savedStory = transactionTemplate.execute(
-                status -> saveGeneratedStoryWithPendingAssets(request, draft, storyKey, storyDir)
+                status -> saveGeneratedStoryWithPendingAssets(request, draft, storyKey, storyDir, member)
         );
-        scheduleBackgroundAssetGeneration(storyKey, storyDir, draft, savedStory.targets());
+        scheduleBackgroundAssetGeneration(storyKey, storyDir, draft, savedStory.targets(), apiKey);
         log.info("Story generation response returned. boardId={}, storyKey={}", savedStory.response().board().id(), storyKey);
         return savedStory.response();
     }
 
-    private OpenAiStoryDraft createDraft(StoryGenerateRequest request) {
+    private OpenAiStoryDraft createDraft(StoryGenerateRequest request, String apiKey) {
         try {
             log.info("OpenAI story content request started. model={}", storyModel);
             String outputText = retry("story content generation", () -> {
@@ -157,10 +163,11 @@ public class StoryGenerateService {
             String storyKey,
             Path storyDir,
             OpenAiStoryDraft draft,
-            List<PageGenerationTarget> targets
+            List<PageGenerationTarget> targets,
+            String apiKey
     ) {
         CompletableFuture.runAsync(
-                () -> generateAndPersistAssetsInBackground(storyKey, storyDir, draft, targets),
+                () -> generateAndPersistAssetsInBackground(storyKey, storyDir, draft, targets, apiKey),
                 backgroundExecutor
         ).exceptionally(ex -> {
             log.error("Background asset generation failed. storyKey={}, failure={}", storyKey, summarizeException(ex));
@@ -173,7 +180,8 @@ public class StoryGenerateService {
             String storyKey,
             Path storyDir,
             OpenAiStoryDraft draft,
-            List<PageGenerationTarget> targets
+            List<PageGenerationTarget> targets,
+            String apiKey
     ) {
         List<OpenAiStoryPage> pages = draft.pages()
                 .stream()
@@ -189,7 +197,7 @@ public class StoryGenerateService {
         ExecutorService executorService = Executors.newFixedThreadPool(workerCount);
         try {
             List<PageAssetFutures> futures = pages.stream()
-                    .map(page -> submitPageAssetTasks(storyKey, storyDir, draft.mainCharacters(), page, executorService))
+                    .map(page -> submitPageAssetTasks(storyKey, storyDir, draft.mainCharacters(), page, executorService, apiKey))
                     .toList();
 
             Map<Integer, PageGenerationTarget> targetByPageNumber = new LinkedHashMap<>();
@@ -217,15 +225,16 @@ public class StoryGenerateService {
             Path storyDir,
             List<OpenAiMainCharacter> mainCharacters,
             OpenAiStoryPage page,
-            ExecutorService executorService
+            ExecutorService executorService,
+            String apiKey
     ) {
         log.info("Page asset tasks submitted. pageNumber={}", page.pageNumber());
         return new PageAssetFutures(
                 page,
-                CompletableFuture.supplyAsync(() -> generateImage(storyKey, storyDir, mainCharacters, page), executorService),
-                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "ko"), executorService),
-                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "en"), executorService),
-                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "ja"), executorService)
+                CompletableFuture.supplyAsync(() -> generateImage(storyKey, storyDir, mainCharacters, page, apiKey), executorService),
+                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "ko", apiKey), executorService),
+                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "en", apiKey), executorService),
+                CompletableFuture.supplyAsync(() -> generateSpeech(storyKey, storyDir, page, "ja", apiKey), executorService)
         );
     }
 
@@ -255,7 +264,8 @@ public class StoryGenerateService {
             String storyKey,
             Path storyDir,
             List<OpenAiMainCharacter> mainCharacters,
-            OpenAiStoryPage page
+            OpenAiStoryPage page,
+            String apiKey
     ) {
         int pageNumber = page.pageNumber();
         try {
@@ -283,7 +293,13 @@ public class StoryGenerateService {
         }
     }
 
-    private String generateSpeech(String storyKey, Path storyDir, OpenAiStoryPage page, String languageCode) {
+    private String generateSpeech(
+            String storyKey,
+            Path storyDir,
+            OpenAiStoryPage page,
+            String languageCode,
+            String apiKey
+    ) {
         int pageNumber = page.pageNumber();
         try {
             log.info(
@@ -324,14 +340,26 @@ public class StoryGenerateService {
             StoryGenerateRequest request,
             OpenAiStoryDraft draft,
             String storyKey,
-            Path storyDir
+            Path storyDir,
+            Member member
     ) {
         log.info("Saving generated story placeholders to database. pageCount={}", draft.pages().size());
+        Member managedMember = memberRepository.findByIdAndDeletedDateIsNull(member.getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Login required"));
+        if (!managedMember.hasStoryPoint()) {
+            throw new ResponseStatusException(
+                    HttpStatus.PAYMENT_REQUIRED,
+                    "동화 포인트가 없습니다. 관리자에게 문의해 주세요."
+            );
+        }
+        managedMember.consumeStoryPoint();
+
         Board board = boardRepository.save(new Board(
                 limit(firstNonBlank(draft.title().ko(), request.title(), autoTitle(request.prompt())), 50),
                 limit(request.prompt(), 256),
                 limit(firstNonBlank(firstPageText(draft), request.prompt()), 256),
-                1
+                1,
+                managedMember
         ));
 
         List<Content> contents = new ArrayList<>();
@@ -427,6 +455,10 @@ public class StoryGenerateService {
                 Create 5 to 8 pages.
                 Every page must include pageNumber, text, and sceneDescription.
                 The story must follow this structure across the pages: beginning, development, conflict, resolution, ending.
+                The final page must feel like a complete fairy-tale ending.
+                It should gently close the story with warmth, reassurance, and a sense that the adventure has come to a peaceful end.
+                Do not end the story abruptly.
+                The last page should include a calm closing scene, emotional resolution, and a final sentence that sounds like the end of a children's storybook.
                 Support Korean, English, and Japanese in every localized field.
                 Keep page text gentle, clear, and suitable for children aged 3 to 8.
                 Avoid scary, violent, horror, dark, disturbing, unsafe, or adult themes.
@@ -759,11 +791,23 @@ public class StoryGenerateService {
         }
     }
 
-    private void ensureApiKeyConfigured() {
-        if (!StringUtils.hasText(apiKey)) {
+    private String configuredApiKey() {
+        if (StringUtils.hasText(configuredApiKey)) {
+            return configuredApiKey.trim();
+        }
+        throw new ResponseStatusException(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "OpenAI API key is not configured. Set openai.api-key in application.yaml"
+        );
+    }
+
+    private void ensureStoryPointExists(Member member) {
+        Member currentMember = memberRepository.findByIdAndDeletedDateIsNull(member.getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Login required"));
+        if (!currentMember.hasStoryPoint()) {
             throw new ResponseStatusException(
-                    HttpStatus.SERVICE_UNAVAILABLE,
-                    "OPENAI_API_KEY is not configured"
+                    HttpStatus.PAYMENT_REQUIRED,
+                    "동화 포인트가 없습니다. 관리자에게 문의해 주세요."
             );
         }
     }

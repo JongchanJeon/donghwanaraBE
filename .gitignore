@@ -1,4 +1,4 @@
-HELP.md
+﻿HELP.md
 .gradle
 build/
 !gradle/wrapper/gradle-wrapper.jar
@@ -35,3 +35,12 @@ out/
 
 ### VS Code ###
 .vscode/
+
+
+### 저장소 ###
+/generated-media
+
+
+### 설정 값 ###
+/src/main/resources/application.yaml
+
